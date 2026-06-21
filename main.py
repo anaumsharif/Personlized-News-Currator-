@@ -1,40 +1,28 @@
 import os
+from groq import Groq
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_huggingface import HuggingFacePipeline
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 # -- SETUP --
 load_dotenv()
 console = Console()
 
-# Check for API keys
+if not os.getenv("GROQ_API_KEY"):
+    console.print("[bold red]Error: GROQ_API_KEY is not set in .env[/bold red]")
+    exit(1)
 if not os.getenv("TAVILY_API_KEY"):
     console.print("[bold red]Error: TAVILY_API_KEY is not set in .env[/bold red]")
     exit(1)
 
-# ---- Use TinyLlama locally (no API key needed) ----
-model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-console.print(f"[dim]Loading {model_name}... (this may take a moment on first run)[/dim]")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
-pipe = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=512,
-    temperature=0.7,
-    do_sample=True,
-)
-llm = HuggingFacePipeline(pipeline=pipe)
+# Initialize Groq
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 search_tool = TavilySearchResults(max_results=5)
 
-# -- CORE FUNCTIONS (unchanged except get_next_search_query) --
+# -- CORE FUNCTIONS --
 def get_initial_topics():
-    """Gets the initial 3 topics from the user."""
     console.print(Panel("[bold cyan]Welcome to your Personalized News Curator![/bold cyan]\n"
                         "To get started, please tell me three topics you're interested in."))
     topics = []
@@ -45,13 +33,10 @@ def get_initial_topics():
     return topics
 
 def search_for_articles(topic: str):
-    """Performs a Tavily search for a given topic."""
     query = f"latest news, articles, and blog posts on '{topic}'"
-    results = search_tool.invoke({"query": query})
-    return results
+    return search_tool.invoke({"query": query})
 
 def get_user_feedback():
-    """Gets a 'like' (1) or 'dislike' (d) from the user, with validation."""
     while True:
         feedback = console.input("[cyan]Like (1) or Dislike (d)? [/cyan]").lower()
         if feedback in ['1', 'd']:
@@ -59,64 +44,69 @@ def get_user_feedback():
         console.print("[red]Invalid input. Please enter '1' or 'd'.[/red]")
 
 def update_preference_model(article_history):
-    """Generates a string summary of the user's preferences."""
-    liked_articles = [article['title'] for article in article_history if article['rating'] == 'like']
-    disliked_articles = [article['title'] for article in article_history if article['rating'] == 'dislike']
-    preference_summary = "The user has expressed interest in the following topics:\n"
-    if liked_articles:
-        preference_summary += "\nLiked Articles:\n- " + "\n- ".join(liked_articles)
-    if disliked_articles:
-        preference_summary += "\nDisliked Articles:\n- " + "\n- ".join(disliked_articles)
-    return preference_summary
+    liked = [a['title'] for a in article_history if a['rating'] == 'like']
+    disliked = [a['title'] for a in article_history if a['rating'] == 'dislike']
+    summary = "The user has expressed interest in the following topics:\n"
+    if liked:
+        summary += "\nLiked Articles:\n- " + "\n- ".join(liked)
+    if disliked:
+        summary += "\nDisliked Articles:\n- " + "\n- ".join(disliked)
+    return summary
+
+def call_groq_inference(prompt: str, model: str = "llama-3.1-8b-instant", max_tokens: int = 150, temperature: float = 0.7) -> str:
+    try:
+        completion = groq_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        console.print(f"[red]Groq API error: {e}[/red]")
+        return ""
 
 def get_next_search_query(preference_model, article_history):
-    """Uses the local LLM to generate the next search query."""
-    seen_titles = [article['title'] for article in article_history]
-    seen_articles_str = "\n- ".join(seen_titles) if seen_titles else "None"
-    
-    # TinyLlama chat format: <|system|>, <|user|>, <|assistant|>
-    prompt = f"""<|system|>
-You are an expert news curator. Your goal is to find the next best article for a user based on their preferences.
+    seen_titles = [a['title'] for a in article_history]
+    seen_str = "\n- ".join(seen_titles) if seen_titles else "None"
+    prompt = f"""You are an expert news curator. Your goal is to find the next best article for a user based on their preferences.
 
 Here is a summary of the user's preferences:
 {preference_model}
 
 Here is a list of articles the user has already seen. Do not suggest queries that would lead to these articles:
-{seen_articles_str}
+{seen_str}
 
 Based on the user's likes and dislikes, generate a single, concise, and effective search query for the Tavily search engine to find a new article.
 
-Output only the search query and nothing else.</s>
-<|user|>
-Generate the next search query.</s>
-<|assistant|>"""
-    
-    response = llm.invoke(prompt)
-    # Extract just the query (remove any extra text)
-    query = response.strip().split("\n")[0]  # take first line
-    return query
+Output only the search query and nothing else."""
+    response = call_groq_inference(prompt, max_tokens=80, temperature=0.7)
+    if response:
+        query = response.split("\n")[0].strip()
+        console.print(f"[dim]Groq suggested: '{query}'[/dim]")
+        return query
+    else:
+        console.print("[bold yellow]Could not generate query. Please enter manually:[/bold yellow]")
+        return console.input("[cyan]Your query: [/cyan]").strip()
 
 def main():
-    """Main function to run the news curator."""
     initial_topics = get_initial_topics()
     article_history = []
 
-    # -- Initial Article Seeding --
+    # Seed initial articles
     for topic in initial_topics:
         articles = search_for_articles(topic)
         if articles:
             article = articles[0]
             article['topic'] = topic
             article['rating'] = None
-
             console.print(Panel(f"[bold]Title:[/bold] {article['title']}\n[bold]URL:[/bold] {article['url']}",
                                 title=f"Article for '{topic}'", border_style="magenta"))
-
             rating = get_user_feedback()
             article['rating'] = rating
             article_history.append(article)
 
-    # -- Continuous Feedback Loop --
+    # Main loop
     while True:
         choice = console.input("\n[bold cyan]Continue with current interests? (y) / Add a new topic? (n) / Exit (e)? [/bold cyan]").lower()
         if choice == 'e':
@@ -135,10 +125,9 @@ def main():
                 article_history.append(article)
             else:
                 console.print(f"[red]No articles found for '{new_topic}'. Try again.[/red]")
-        else:  # 'y' or anything else
+        else:  # 'y'
             preference_model = update_preference_model(article_history)
             next_query = get_next_search_query(preference_model, article_history)
-            console.print(f"[dim]Generating next search query: '{next_query}'[/dim]")
             articles = search_for_articles(next_query)
             if articles:
                 article = articles[0]
@@ -149,16 +138,16 @@ def main():
                 rating = get_user_feedback()
                 article['rating'] = rating
                 article_history.append(article)
-                console.print(f"You {rating}d this article. I'm updating your preferences.\n")
+                console.print(f"You {rating}d this article. Updating preferences...\n")
             else:
-                console.print(f"[red]My search for '{next_query}' didn't find anything. Let's try again.[/red]")
+                console.print(f"[red]No results for '{next_query}'. Try again.[/red]")
 
-    # -- Final Summary --
+    # Summary
     console.print("\n" + "=" * 50)
     console.print("[bold underline]Your Final Reading History[/bold underline]")
     for article in article_history:
-        status_color = "green" if article['rating'] == 'like' else "red"
-        console.print(f"- [{status_color}]{article['rating']}[/{status_color}] {article['title']}")
+        color = "green" if article['rating'] == 'like' else "red"
+        console.print(f"- [{color}]{article['rating']}[/{color}] {article['title']}")
     console.print("=" * 50 + "\n")
 
 if __name__ == "__main__":

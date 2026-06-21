@@ -7,3 +7,4 @@ rich>=13.0.0,<14.0.0
 transformers>=4.40.0   # for local models
 torch>=2.0.0           # backend
 sentencepiece>=0.1.99  # tokenizer for some models
+groq>=0.9.0,<1.0.0
