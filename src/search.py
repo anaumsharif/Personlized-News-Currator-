@@ -1,5 +1,8 @@
+import warnings
 from typing import List, Dict
 from urllib.parse import urlparse
+# Suppress the deprecation warning for TavilySearchResults
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain_community.tools.tavily_search")
 from langchain_community.tools.tavily_search import TavilySearchResults
 from .config import TAVILY_MAX_RESULTS
 from .enrichment import enrich_article
@@ -7,12 +10,13 @@ from .enrichment import enrich_article
 search_tool = TavilySearchResults(max_results=TAVILY_MAX_RESULTS)
 
 def search_for_articles(topic: str) -> List[Dict]:
-    """Fetch articles from Tavily and enrich the first one."""
-    query = f"latest news, articles, and blog posts on '{topic}'"
-    results = search_tool.invoke({"query": query})
+    """Perform a broad search on a topic and enrich results."""
+    query = f"latest news articles about {topic}"
+    results = search_tool.invoke({"query": query})  # returns list of dicts
+
     if results:
-        # Ensure source field exists – try to extract from URL if not present
         for result in results:
+            # Ensure source field exists – extract from URL if not present
             if 'source' not in result or not result['source']:
                 url = result.get('url', '')
                 if url:
@@ -23,6 +27,6 @@ def search_for_articles(topic: str) -> List[Dict]:
                     result['source'] = domain
                 else:
                     result['source'] = 'Unknown source'
-        # Enrich the first result
-        results[0] = enrich_article(results[0])
+            # Enrich each result (adds summary, tags, author)
+            result = enrich_article(result)
     return results

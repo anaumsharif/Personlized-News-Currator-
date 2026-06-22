@@ -17,9 +17,15 @@ def init_db() -> None:
             tags TEXT,
             source TEXT,
             author TEXT,
+            extracted_topics TEXT,  -- NEW: JSON array of topics
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Add column if it doesn't exist (for existing databases)
+    try:
+        c.execute("ALTER TABLE articles ADD COLUMN extracted_topics TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -28,11 +34,21 @@ def save_article(article: Dict) -> Dict:
     c = conn.cursor()
     c.execute("SELECT id FROM articles WHERE url = ?", (article['url'],))
     row = c.fetchone()
+    
+    # Convert extracted_topics to JSON string
+    extracted_topics = article.get('extracted_topics', [])
+    if isinstance(extracted_topics, list):
+        import json
+        extracted_topics_str = json.dumps(extracted_topics)
+    else:
+        extracted_topics_str = extracted_topics
+    
     if row:
         article_id = row[0]
         c.execute('''
             UPDATE articles
-            SET title = ?, snippet = ?, topic = ?, rating = ?, summary = ?, tags = ?, source = ?, author = ?
+            SET title = ?, snippet = ?, topic = ?, rating = ?, summary = ?, 
+                tags = ?, source = ?, author = ?, extracted_topics = ?
             WHERE id = ?
         ''', (
             article['title'],
@@ -43,12 +59,13 @@ def save_article(article: Dict) -> Dict:
             article.get('tags', ''),
             article.get('source', ''),
             article.get('author', ''),
+            extracted_topics_str,
             article_id
         ))
     else:
         c.execute('''
-            INSERT INTO articles (title, url, snippet, topic, rating, summary, tags, source, author)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO articles (title, url, snippet, topic, rating, summary, tags, source, author, extracted_topics)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             article['title'],
             article['url'],
@@ -58,7 +75,8 @@ def save_article(article: Dict) -> Dict:
             article.get('summary', ''),
             article.get('tags', ''),
             article.get('source', ''),
-            article.get('author', '')
+            article.get('author', ''),
+            extracted_topics_str
         ))
         article_id = c.lastrowid
     conn.commit()
@@ -70,7 +88,7 @@ def load_all_articles() -> List[Dict]:
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        SELECT id, title, url, snippet, topic, rating, summary, tags, source, author
+        SELECT id, title, url, snippet, topic, rating, summary, tags, source, author, extracted_topics
         FROM articles
         ORDER BY created_at ASC
     ''')
@@ -78,6 +96,13 @@ def load_all_articles() -> List[Dict]:
     conn.close()
     articles = []
     for row in rows:
+        import json
+        extracted_topics = row[10]
+        if extracted_topics:
+            try:
+                extracted_topics = json.loads(extracted_topics)
+            except:
+                extracted_topics = []
         articles.append({
             'id': row[0],
             'title': row[1],
@@ -88,7 +113,8 @@ def load_all_articles() -> List[Dict]:
             'summary': row[6] or '',
             'tags': row[7] or '',
             'source': row[8] or '',
-            'author': row[9] or ''
+            'author': row[9] or '',
+            'extracted_topics': extracted_topics or []
         })
     return articles
 

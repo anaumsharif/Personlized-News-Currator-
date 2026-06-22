@@ -1,2 +1,8 @@
 .env
-.news/
+.news/  
+__pycache__/
+*.pyc
+news_curator.db
+topic_scores.json
+chroma_db/
+*.log                                                                     
