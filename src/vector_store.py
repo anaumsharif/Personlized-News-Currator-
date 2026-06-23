@@ -2,10 +2,15 @@ import os
 import shutil
 import requests
 import uuid
+import numpy as np
 from typing import List, Dict, Optional
 import chromadb
 from chromadb.config import Settings
-from .config import (CHROMA_DB_PATH, HF_EMBEDDING_URL, HUGGINGFACEHUB_API_TOKEN,WEIGHT_SIMILARITY, WEIGHT_RECENCY, WEIGHT_AUTHORITY, WEIGHT_QUALITY,RECENCY_DECAY_RATE)
+from .config import (
+    CHROMA_DB_PATH, HF_EMBEDDING_URL, HUGGINGFACEHUB_API_TOKEN,
+    WEIGHT_SIMILARITY, WEIGHT_RECENCY, WEIGHT_AUTHORITY, WEIGHT_QUALITY,
+    RECENCY_DECAY_RATE
+)
 from .authority import get_authority_score
 from .quality import compute_quality_score
 
@@ -18,8 +23,19 @@ _collection = None
 _embedder = None
 _use_api = True  # start with API
 
+# ---- Helper: cosine similarity ----
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    if a is None or b is None:
+        return 0.5
+    a = np.array(a)
+    b = np.array(b)
+    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+        return 0.0
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+# ---- ChromaDB client and collection ----
 def _get_client():
-    """Create PersistentClient with retry on settings conflict."""
     global _chroma_client
     if _chroma_client is not None:
         return _chroma_client
@@ -42,7 +58,6 @@ def _get_client():
             raise
 
 def _get_collection():
-    """Get or create the collection."""
     global _collection
     if _collection is not None:
         return _collection
@@ -54,7 +69,6 @@ def _get_collection():
     return _collection
 
 def reset_collection():
-    """Delete and recreate the collection (clears all embeddings)."""
     global _collection, _chroma_client
     if _chroma_client is None:
         _chroma_client = _get_client()
@@ -68,7 +82,7 @@ def reset_collection():
     )
     print("[INFO] ChromaDB collection reset.")
 
-# ---- Embedding provider (HF API with fallback to local) ----
+# ---- Embedding provider (HF API with local fallback) ----
 def get_embedding(text: str) -> List[float]:
     global _use_api, _embedder
     if _use_api:
@@ -91,7 +105,6 @@ def get_embedding(text: str) -> List[float]:
             _use_api = False
             return get_embedding(text)
 
-    # ---- Local fallback ----
     if _embedder is None:
         try:
             from sentence_transformers import SentenceTransformer
@@ -104,7 +117,7 @@ def get_embedding(text: str) -> List[float]:
     embedding = _embedder.encode(text).tolist()
     return embedding
 
-# ---- CRUD operations (using lazy collection) ----
+# ---- CRUD operations ----
 def store_article_embedding(article: Dict) -> None:
     text = f"{article['title']}: {article.get('summary', article.get('snippet', ''))}"
     embedding = get_embedding(text)
@@ -123,81 +136,69 @@ def store_article_embedding(article: Dict) -> None:
     )
 
 def get_preference_vectors() -> tuple[Optional[List[float]], Optional[List[float]]]:
-    """
-    Return (positive_vector, negative_vector) as averages of liked/disliked embeddings.
-    """
     coll = _get_collection()
     pos_results = coll.get(where={"rating": "like"}, include=["embeddings"])
     neg_results = coll.get(where={"rating": "dislike"}, include=["embeddings"])
 
     pos_avg = None
-    if pos_results and pos_results['embeddings']:
+    if pos_results and 'embeddings' in pos_results and pos_results['embeddings'] is not None:
         embeds = pos_results['embeddings']
-        pos_avg = [sum(vals) / len(vals) for vals in zip(*embeds)]
+        if len(embeds) > 0:
+            embeds = [list(e) for e in embeds]  # ensure lists
+            pos_avg = [sum(vals) / len(vals) for vals in zip(*embeds)]
 
     neg_avg = None
-    if neg_results and neg_results['embeddings']:
+    if neg_results and 'embeddings' in neg_results and neg_results['embeddings'] is not None:
         embeds = neg_results['embeddings']
-        neg_avg = [sum(vals) / len(vals) for vals in zip(*embeds)]
+        if len(embeds) > 0:
+            embeds = [list(e) for e in embeds]
+            neg_avg = [sum(vals) / len(vals) for vals in zip(*embeds)]
 
     return pos_avg, neg_avg
 
 def compute_recency_score(article: Dict) -> float:
-    """
-    Compute recency score using published date if available, else current date.
-    Returns a score between 0.1 and 1.0.
-    """
-    # Tavily may provide 'published_date' or 'date'
+    from datetime import datetime
     date_str = article.get('published_date') or article.get('date') or ''
     if not date_str:
-        # No date: assume recent (score 1.0) to avoid penalising
         return 1.0
     try:
-        from datetime import datetime
-        # Try to parse ISO or common format
-        # Simple: assume format like "2025-06-23"
-        pub_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
-        days_old = (datetime.now() - pub_date).days
-        # Exponential decay
-        score = pow(2.718, -RECENCY_DECAY_RATE * days_old)
+        if 'T' in date_str:
+            pub_date = datetime.fromisoformat(date_str.replace('Z', '+00:00')).date()
+        else:
+            pub_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+        days_old = (datetime.now().date() - pub_date).days
+        score = np.exp(-RECENCY_DECAY_RATE * days_old)
         return max(0.1, min(1.0, score))
     except Exception:
         return 1.0
-    
+
+# ---- Multi-signal reranking (fixed without ChromaDB similarity) ----
 def rerank_articles(
     candidates: List[Dict],
     pos_vector: Optional[List[float]],
     neg_vector: Optional[List[float]],
     top_k: int = 1
 ) -> List[Dict]:
-    """
-    Rerank candidates using multi-signal scoring: similarity (positive - negative),
-    recency, authority, quality.
-    Returns top_k articles with computed scores.
-    """
     if not candidates:
         return []
 
-    # Compute embeddings for each candidate (if not already)
+    # Ensure embeddings exist
     for c in candidates:
         if 'embedding' not in c:
             text = f"{c['title']}: {c.get('summary', c.get('snippet', ''))}"
             c['embedding'] = get_embedding(text)
 
-    from chromadb.utils import embedding_functions
-    ef = embedding_functions.CosineSimilarity()
-
     for c in candidates:
-        # 1. Similarity with positive and negative vectors
-        pos_sim = ef(pos_vector, c['embedding']) if pos_vector is not None else 0.5
-        neg_sim = ef(neg_vector, c['embedding']) if neg_vector is not None else 0.0
-        # Combine: positive minus a fraction of negative (we use 0.3 factor)
+        # 1. Similarity to positive and negative vectors
+        pos_sim = cosine_similarity(pos_vector, c['embedding']) if pos_vector is not None else 0.5
+        neg_sim = cosine_similarity(neg_vector, c['embedding']) if neg_vector is not None else 0.0
         sim_score = pos_sim - 0.3 * neg_sim
-        # Clamp to [0,1]
         sim_score = max(0.0, min(1.0, sim_score))
+        c['similarity'] = sim_score
 
         # 2. Recency
         recency = compute_recency_score(c)
+        c['recency'] = recency
 
         # 3. Authority
         source = c.get('source', '')
@@ -205,22 +206,19 @@ def rerank_articles(
         if domain.startswith('www.'):
             domain = domain[4:]
         authority = get_authority_score(domain)
+        c['authority'] = authority
 
         # 4. Quality
         quality = compute_quality_score(c)
+        c['quality'] = quality
 
-        # Weighted sum
-        final_score = (
+        # Final weighted score
+        c['final_score'] = (
             WEIGHT_SIMILARITY * sim_score +
             WEIGHT_RECENCY * recency +
             WEIGHT_AUTHORITY * authority +
             WEIGHT_QUALITY * quality
         )
-        c['final_score'] = final_score
-        c['similarity'] = sim_score
-        c['recency'] = recency
-        c['authority'] = authority
-        c['quality'] = quality
 
     candidates.sort(key=lambda x: x['final_score'], reverse=True)
     return candidates[:top_k]

@@ -216,17 +216,35 @@ def run():
                 article['topic'] = selected_topic
                 article['rating'] = None
 
-                # Generate explanation
+                # Ensure extracted topics exist for the article
+                if not article.get('extracted_topics'):
+                    article['extracted_topics'] = topics.extract_topics(article)
+
+                # Extract scores
+                sim = article.get('similarity', None)
+                rec = article.get('recency', None)
+                auth = article.get('authority', None)
+                qual = article.get('quality', None)
+
+                # Get liked and disliked articles for pattern context
                 liked_articles = [a for a in article_history if a['rating'] == 'like']
                 disliked_articles = [a for a in article_history if a['rating'] == 'dislike']
+
+                # Generate explanation
                 explanation = explain.generate_recommendation_explanation(
                     article,
                     selected_topic,
                     liked_articles,
-                    disliked_articles
+                    disliked_articles,
+                    similarity_score=sim,
+                    recency_score=rec,
+                    authority_score=auth,
+                    quality_score=qual
                 )
 
                 display.display_article(article, title="Your Next Suggested Article (Reranked)", explanation=explanation)
+
+    # ... rest (feedback, save, etc.)
 
                 # Get feedback
                 rating = feedback.get_user_feedback()
