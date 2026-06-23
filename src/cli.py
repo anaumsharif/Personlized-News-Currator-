@@ -8,10 +8,12 @@ from . import feedback
 from . import search
 from . import topics
 from . import vector_store
-from .config import GROQ_API_KEY, GROQ_MODEL, TAVILY_MAX_RESULTS
+from . import explain
+from . import trending                     # <-- new import for trending menu
+from .config import GROQ_API_KEY, GROQ_MODEL
 
 console = Console()
-groq_client = Groq(api_key=GROQ_API_KEY)  # for preference analysis
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 def process_article_feedback(article: Dict, article_history: List[Dict]) -> str:
     """Process user feedback and update all systems."""
@@ -37,11 +39,9 @@ def generate_enhanced_profile(article_history: List[Dict]) -> str:
     if not article_history:
         return "No preferences recorded yet. Rate some articles to build your profile."
 
-    # Separate liked and disliked articles, take last 20 for context
     liked = [a for a in article_history if a['rating'] == 'like'][-10:]
     disliked = [a for a in article_history if a['rating'] == 'dislike'][-10:]
 
-    # Build a structured representation for Groq
     likes_text = ""
     for a in liked:
         summary = a.get('summary', a.get('snippet', 'No summary'))
@@ -86,7 +86,6 @@ Write a detailed preference summary:"""
     except Exception as e:
         detailed_summary = f"Could not generate detailed analysis: {str(e)}"
 
-    # Also include topic scores and recent stats
     scores = topics.load_topic_scores()
     top_topics = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
     stats = f"\n\n📊 **Topic Scores:**\n"
@@ -96,7 +95,6 @@ Write a detailed preference summary:"""
 
     stats += f"\n👍 Liked: {len(liked)} | 👎 Disliked: {len(disliked)}"
 
-    # Combine the detailed summary with stats
     return f"{detailed_summary}\n{stats}"
 
 def run():
@@ -106,7 +104,6 @@ def run():
     article_history = db.load_all_articles()
 
     if article_history:
-        # Sync existing articles with ChromaDB (migration)
         for article in article_history:
             if article['rating']:
                 vector_store.store_article_embedding(article)
@@ -132,7 +129,7 @@ def run():
                 process_article_feedback(article, article_history)
 
     while True:
-        console.print("\n[yellow]Options:[/yellow] (y) continue | (n) new topic | (p) show preferences | (e) exit")
+        console.print("\n[yellow]Options:[/yellow] (y) continue | (n) new topic | (p) show preferences | (t) trending | (e) exit")
         choice = console.input("[bold cyan]Your choice: [/bold cyan]").lower()
 
         if choice == 'e':
@@ -143,6 +140,35 @@ def run():
                 display.display_preferences(profile)
             else:
                 console.print("[yellow]No articles rated yet.[/yellow]")
+            continue
+        elif choice == 't':
+            # ---- Trending Discovery Menu ----
+            console.print("[dim]Fetching trending topics...[/dim]")
+            trending_topics = trending.fetch_trending_topics()
+            if not trending_topics:
+                console.print("[red]Could not fetch trending topics. Try again later.[/red]")
+                continue
+            console.print("[bold]Trending Topics:[/bold]")
+            for i, item in enumerate(trending_topics, 1):
+                console.print(f"[{i}] {item['topic']} (from {item['source']})")
+            pick = console.input("[cyan]Enter number to explore, or 'c' to cancel: [/cyan]")
+            if pick.lower() == 'c':
+                continue
+            if pick.isdigit() and 1 <= int(pick) <= len(trending_topics):
+                chosen = trending_topics[int(pick)-1]
+                topic = chosen['topic']
+                console.print(f"[green]Searching for '{topic}'...[/green]")
+                articles = search.search_for_articles(topic)
+                if articles:
+                    article = articles[0]
+                    article['topic'] = topic
+                    article['rating'] = None
+                    display.display_article(article, title=f"Article for trending topic '{topic}'")
+                    process_article_feedback(article, article_history)
+                else:
+                    console.print(f"[red]No articles found for '{topic}'. Try another.[/red]")
+            else:
+                console.print("[red]Invalid selection.[/red]")
             continue
         elif choice == 'n':
             new_topic = console.input("[yellow]Enter new topic: [/yellow]")
@@ -167,26 +193,42 @@ def run():
 
             console.print(f"[dim]Selected topic: '{selected_topic}' based on your interests[/dim]")
 
-            articles = search.search_for_articles(selected_topic)
+            # Perform broad search
+            candidates = search.search_for_articles(selected_topic)
 
-            if not articles:
+            if not candidates:
                 console.print(f"[red]No results for '{selected_topic}'. Try adding a new topic.[/red]")
                 continue
 
-            preference_vector = vector_store.get_preference_vector()
+            # Get positive and negative preference vectors
+            pos_vector, neg_vector = vector_store.get_preference_vectors()
 
-            if preference_vector:
-                console.print("[dim]Reranking results based on your preferences...[/dim]")
-                top_articles = vector_store.rerank_articles(articles, preference_vector, top_k=1)
-            else:
-                top_articles = articles[:1]
+            # Rerank with multi-signal scoring
+            top_articles = vector_store.rerank_articles(
+                candidates,
+                pos_vector,
+                neg_vector,
+                top_k=1
+            )
 
             if top_articles:
                 article = top_articles[0]
                 article['topic'] = selected_topic
                 article['rating'] = None
-                display.display_article(article, title="Your Next Suggested Article (Reranked)")
 
+                # Generate explanation
+                liked_articles = [a for a in article_history if a['rating'] == 'like']
+                disliked_articles = [a for a in article_history if a['rating'] == 'dislike']
+                explanation = explain.generate_recommendation_explanation(
+                    article,
+                    selected_topic,
+                    liked_articles,
+                    disliked_articles
+                )
+
+                display.display_article(article, title="Your Next Suggested Article (Reranked)", explanation=explanation)
+
+                # Get feedback
                 rating = feedback.get_user_feedback()
                 article['rating'] = rating
 
@@ -201,7 +243,7 @@ def run():
             else:
                 console.print(f"[red]No articles found for '{selected_topic}'. Try again.[/red]")
         else:
-            console.print("[red]Invalid option. Please enter y, n, p, or e.[/red]")
+            console.print("[red]Invalid option. Please enter y, n, p, t, or e.[/red]")
 
     console.print("\n" + "=" * 50)
     console.print("[bold underline]Your Final Reading History[/bold underline]")
